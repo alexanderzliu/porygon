@@ -366,6 +366,7 @@ class SimpleAgent:
         
         logger.info(f"[Agent] Game Progress Summary:")
         logger.info(f"{summary_text}")
+        self.tui.on_usage(response)
         self.tui.on_summary(summary_text)
         
         # Replace message history with just the summary

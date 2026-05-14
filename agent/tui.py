@@ -64,12 +64,15 @@ class TUI:
         self._refresh()
 
     def on_response(self, response, reasoning_text: str) -> None:
-        before = self.usage.cost_usd
-        self.usage.add(response.usage)
-        self.last_step_cost = self.usage.cost_usd - before
+        self.on_usage(response)
         self.reasoning = reasoning_text.strip() or "(no reasoning text)"
         self.summary = ""
         self._refresh()
+
+    def on_usage(self, response) -> None:
+        before = self.usage.cost_usd
+        self.usage.add(response.usage)
+        self.last_step_cost = self.usage.cost_usd - before
 
     def on_press(self, buttons: list[str]) -> None:
         self._record_action(f"press {' '.join(buttons)}")
@@ -145,6 +148,7 @@ class _NullTUI:
     def stop(self) -> None: pass
     def on_step(self, *a, **k) -> None: pass
     def on_response(self, *a, **k) -> None: pass
+    def on_usage(self, *a, **k) -> None: pass
     def on_press(self, *a, **k) -> None: pass
     def on_navigate(self, *a, **k) -> None: pass
     def on_game_state(self, *a, **k) -> None: pass
