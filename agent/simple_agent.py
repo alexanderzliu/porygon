@@ -4,10 +4,10 @@ import io
 import logging
 import os
 
-from config import MAX_TOKENS, MODEL_NAME, TEMPERATURE, USE_NAVIGATOR
+from config import AWS_REGION, MAX_TOKENS, MODEL_NAME, TEMPERATURE, USE_NAVIGATOR
 
 from agent.emulator import Emulator
-from anthropic import Anthropic
+from anthropic import AnthropicBedrock
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -105,7 +105,7 @@ class SimpleAgent:
         """
         self.emulator = Emulator(rom_path, headless, sound)
         self.emulator.initialize()  # Initialize the emulator
-        self.client = Anthropic()
+        self.client = AnthropicBedrock(aws_region=AWS_REGION)
         self.running = True
         self.message_history = [{"role": "user", "content": "You may now begin playing."}]
         self.max_history = max_history
@@ -268,7 +268,12 @@ class SimpleAgent:
                         if block.type == "text":
                             assistant_content.append({"type": "text", "text": block.text})
                         elif block.type == "tool_use":
-                            assistant_content.append({"type": "tool_use", **dict(block)})
+                            assistant_content.append({
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": block.input,
+                            })
                     
                     self.message_history.append(
                         {"role": "assistant", "content": assistant_content}
