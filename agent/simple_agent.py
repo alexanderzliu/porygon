@@ -7,6 +7,7 @@ import os
 from config import AWS_REGION, MAX_TOKENS, MODEL_NAME, TEMPERATURE, USE_NAVIGATOR
 
 from agent.emulator import Emulator
+from agent.tui import NULL_TUI
 from anthropic import AnthropicBedrock
 
 # Set up logging
@@ -94,7 +95,7 @@ if USE_NAVIGATOR:
 
 
 class SimpleAgent:
-    def __init__(self, rom_path, headless=True, sound=False, max_history=60, load_state=None, display=None):
+    def __init__(self, rom_path, headless=True, sound=False, max_history=60, load_state=None, tui=None):
         """Initialize the simple agent.
 
         Args:
@@ -102,7 +103,7 @@ class SimpleAgent:
             headless: Whether to run without display
             sound: Whether to enable sound
             max_history: Maximum number of messages in history before summarization
-            display: Optional TUI Display instance for live rendering
+            tui: Optional TUI instance for live rendering; defaults to a no-op stub
         """
         self.emulator = Emulator(rom_path, headless, sound)
         self.emulator.initialize()  # Initialize the emulator
@@ -110,7 +111,7 @@ class SimpleAgent:
         self.running = True
         self.message_history = [{"role": "user", "content": "You may now begin playing."}]
         self.max_history = max_history
-        self.display = display
+        self.tui = tui or NULL_TUI
         if load_state:
             logger.info(f"Loading saved state from {load_state}")
             self.emulator.load_state(load_state)
@@ -125,8 +126,7 @@ class SimpleAgent:
             buttons = tool_input["buttons"]
             wait = tool_input.get("wait", True)
             logger.info(f"[Buttons] Pressing: {buttons} (wait={wait})")
-            if self.display:
-                self.display.on_action(f"press {' '.join(buttons)}")
+            self.tui.on_press(buttons)
 
             result = self.emulator.press_buttons(buttons, wait)
 
@@ -140,13 +140,12 @@ class SimpleAgent:
             # Log the memory state after the tool call
             logger.info(f"[Memory State after action]")
             logger.info(memory_info)
-            if self.display:
-                self.display.on_game_state(memory_info)
-            
+            self.tui.on_game_state(memory_info)
+
             collision_map = self.emulator.get_collision_map()
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
-            
+
             # Return tool result as a dictionary
             return {
                 "type": "tool_result",
@@ -169,8 +168,7 @@ class SimpleAgent:
             row = tool_input["row"]
             col = tool_input["col"]
             logger.info(f"[Navigation] Navigating to: ({row}, {col})")
-            if self.display:
-                self.display.on_action(f"navigate to ({row}, {col})")
+            self.tui.on_navigate(row, col)
 
             status, path = self.emulator.find_path(row, col)
             if path:
@@ -190,13 +188,12 @@ class SimpleAgent:
             # Log the memory state after the tool call
             logger.info(f"[Memory State after action]")
             logger.info(memory_info)
-            if self.display:
-                self.display.on_game_state(memory_info)
-            
+            self.tui.on_game_state(memory_info)
+
             collision_map = self.emulator.get_collision_map()
             if collision_map:
                 logger.info(f"[Collision Map after action]\n{collision_map}")
-            
+
             # Return tool result as a dictionary
             return {
                 "type": "tool_result",
@@ -272,9 +269,8 @@ class SimpleAgent:
                     elif block.type == "tool_use":
                         logger.info(f"[Tool] Using tool: {block.name}")
 
-                if self.display:
-                    self.display.on_step(steps_completed + 1, num_steps)
-                    self.display.on_response(response, "\n".join(reasoning_chunks))
+                self.tui.on_step(steps_completed + 1, num_steps)
+                self.tui.on_response(response, "\n".join(reasoning_chunks))
 
                 # Process tool calls
                 if tool_calls:
@@ -370,8 +366,7 @@ class SimpleAgent:
         
         logger.info(f"[Agent] Game Progress Summary:")
         logger.info(f"{summary_text}")
-        if self.display:
-            self.display.on_summary(summary_text)
+        self.tui.on_summary(summary_text)
         
         # Replace message history with just the summary
         self.message_history = [

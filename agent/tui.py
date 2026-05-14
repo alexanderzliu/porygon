@@ -1,19 +1,17 @@
 from collections import deque
 from dataclasses import dataclass, field
 
-from rich.console import Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
-
-# Sonnet 4.5 Bedrock pricing ($/MTok)
-PRICE_INPUT = 3.00
-PRICE_OUTPUT = 15.00
-PRICE_CACHE_READ = 0.30
-PRICE_CACHE_WRITE_5M = 3.75
+from config import (
+    PRICE_CACHE_READ_PER_MTOK,
+    PRICE_CACHE_WRITE_PER_MTOK,
+    PRICE_INPUT_PER_MTOK,
+    PRICE_OUTPUT_PER_MTOK,
+)
 
 
 @dataclass
@@ -24,26 +22,27 @@ class Usage:
     cache_write_tokens: int = 0
 
     def add(self, u) -> None:
-        self.input_tokens += getattr(u, "input_tokens", 0) or 0
-        self.output_tokens += getattr(u, "output_tokens", 0) or 0
-        self.cache_read_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
-        self.cache_write_tokens += getattr(u, "cache_creation_input_tokens", 0) or 0
+        self.input_tokens += u.input_tokens or 0
+        self.output_tokens += u.output_tokens or 0
+        self.cache_read_tokens += u.cache_read_input_tokens or 0
+        self.cache_write_tokens += u.cache_creation_input_tokens or 0
 
     @property
     def cost_usd(self) -> float:
         return (
-            self.input_tokens * PRICE_INPUT
-            + self.output_tokens * PRICE_OUTPUT
-            + self.cache_read_tokens * PRICE_CACHE_READ
-            + self.cache_write_tokens * PRICE_CACHE_WRITE_5M
+            self.input_tokens * PRICE_INPUT_PER_MTOK
+            + self.output_tokens * PRICE_OUTPUT_PER_MTOK
+            + self.cache_read_tokens * PRICE_CACHE_READ_PER_MTOK
+            + self.cache_write_tokens * PRICE_CACHE_WRITE_PER_MTOK
         ) / 1_000_000
 
 
 @dataclass
-class Display:
+class TUI:
     step: int = 0
     total_steps: int = 0
     reasoning: str = ""
+    summary: str = ""
     actions: deque = field(default_factory=lambda: deque(maxlen=12))
     game_state: str = ""
     usage: Usage = field(default_factory=Usage)
@@ -59,28 +58,35 @@ class Display:
             self._live.stop()
             self._live = None
 
-    def on_response(self, response, reasoning_text: str) -> None:
-        before = self.usage.cost_usd
-        self.usage.add(response.usage)
-        self.last_step_cost = self.usage.cost_usd - before
-        self.reasoning = reasoning_text.strip() or "(no reasoning text)"
-        self._refresh()
-
-    def on_action(self, label: str) -> None:
-        self.actions.appendleft(f"[step {self.step}] {label}")
-        self._refresh()
-
     def on_step(self, step: int, total: int) -> None:
         self.step = step
         self.total_steps = total
         self._refresh()
 
+    def on_response(self, response, reasoning_text: str) -> None:
+        before = self.usage.cost_usd
+        self.usage.add(response.usage)
+        self.last_step_cost = self.usage.cost_usd - before
+        self.reasoning = reasoning_text.strip() or "(no reasoning text)"
+        self.summary = ""
+        self._refresh()
+
+    def on_press(self, buttons: list[str]) -> None:
+        self._record_action(f"press {' '.join(buttons)}")
+
+    def on_navigate(self, row: int, col: int) -> None:
+        self._record_action(f"navigate to ({row}, {col})")
+
     def on_game_state(self, state: str) -> None:
         self.game_state = state
         self._refresh()
 
-    def on_summary(self, summary: str) -> None:
-        self.reasoning = f"[bold yellow]SUMMARIZED HISTORY[/bold yellow]\n\n{summary}"
+    def on_summary(self, summary_text: str) -> None:
+        self.summary = summary_text
+        self._refresh()
+
+    def _record_action(self, label: str) -> None:
+        self.actions.appendleft(f"[step {self.step}] {label}")
         self._refresh()
 
     def _refresh(self) -> None:
@@ -104,32 +110,45 @@ class Display:
         return layout
 
     def _header(self) -> Panel:
-        cost = self.usage.cost_usd
         tokens_in = self.usage.input_tokens + self.usage.cache_read_tokens + self.usage.cache_write_tokens
-        tokens_out = self.usage.output_tokens
         step_label = f"{self.step}/{self.total_steps}" if self.total_steps else str(self.step)
         text = Text.assemble(
             ("CLAUDE PLAYS POKEMON  ", "bold magenta"),
             (f"step {step_label}   ", "cyan"),
-            (f"tokens in {tokens_in:,}  out {tokens_out:,}   ", "dim"),
-            (f"cost ${cost:.4f}  (Δ ${self.last_step_cost:.4f})", "bold green"),
+            (f"tokens in {tokens_in:,}  out {self.usage.output_tokens:,}   ", "dim"),
+            (f"cost ${self.usage.cost_usd:.4f}  (Δ ${self.last_step_cost:.4f})", "bold green"),
         )
         return Panel(text, border_style="magenta")
 
     def _reasoning_panel(self) -> Panel:
-        return Panel(
-            Text.from_markup(self.reasoning or "(waiting for Claude...)"),
-            title="reasoning",
-            border_style="cyan",
-        )
+        if self.summary:
+            body = Text.assemble(
+                ("SUMMARIZED HISTORY\n\n", "bold yellow"),
+                (self.summary, ""),
+            )
+        else:
+            body = Text(self.reasoning or "(waiting for Claude...)")
+        return Panel(body, title="reasoning", border_style="cyan")
 
     def _actions_panel(self) -> Panel:
-        if not self.actions:
-            body = Text("(no actions yet)", style="dim")
-        else:
-            body = Text("\n".join(self.actions))
+        body = Text("\n".join(self.actions)) if self.actions else Text("(no actions yet)", style="dim")
         return Panel(body, title="recent actions", border_style="yellow")
 
     def _game_panel(self) -> Panel:
-        body = Text(self.game_state or "(no state yet)")
-        return Panel(body, title="game state", border_style="green")
+        return Panel(Text(self.game_state or "(no state yet)"), title="game state", border_style="green")
+
+
+class _NullTUI:
+    """No-op stand-in so SimpleAgent can call self.tui.* unconditionally."""
+
+    def start(self) -> None: pass
+    def stop(self) -> None: pass
+    def on_step(self, *a, **k) -> None: pass
+    def on_response(self, *a, **k) -> None: pass
+    def on_press(self, *a, **k) -> None: pass
+    def on_navigate(self, *a, **k) -> None: pass
+    def on_game_state(self, *a, **k) -> None: pass
+    def on_summary(self, *a, **k) -> None: pass
+
+
+NULL_TUI = _NullTUI()
