@@ -41,16 +41,26 @@ SweepWorkflow                    # one per `evals run <suite.yaml>` invocation
   │  fans out child workflows, bounded by concurrency cap
   │
   ▼
-TrialWorkflow(trial_id, scenario_id, harness_id, params_override, trial_index)
-  │  step_ref = await init_trial(...)                  # writes step_000/
+TrialWorkflow(trial_id, scenario_id, harness_id, params_override, trial_index,
+              [resume_step_ref, resume_running_totals, resume_step_index])
+  │  if not resuming:
+  │      step_ref = await init_trial(...)              # writes step_000/
   │  loop:
-  │      result, step_ref = await run_agent_step(step_ref)   # writes step_<NNN>/metrics.json
-  │      if await check_milestone(step_ref, scenario.success): break
+  │      result = await run_agent_step(step_ref, scenario.success_spec)
+  │                                                   # writes step_<NNN+1>/ incl. metrics.json,
+  │                                                   # evaluates success predicate as part of the step,
+  │                                                   # returns (StepMetrics, new_step_ref, milestone_reached)
+  │      step_ref = result.step_ref
+  │      update running_totals
+  │      if result.milestone_reached: break
   │      if exceeded caps: break
-  │  await finalize_trial(trial_id, outcome, step_ref)        # writes trial.json + regenerates steps.jsonl
+  │      if step_index % CONTINUE_AS_NEW_EVERY == 0:
+  │          workflow.continue_as_new(TrialInit(..., resume_step_ref=step_ref,
+  │                                              resume_running_totals=..., resume_step_index=step_index))
+  │  await finalize_trial(trial_id, outcome, step_ref)  # writes trial.json + regenerates steps.jsonl
 
 SweepWorkflow tail:
-  await finalize_sweep(run_id)                                # writes summary.jsonl from all trial.json files
+  await finalize_sweep(run_id)                         # writes summary.jsonl from all trial.json files
 ```
 
 Activities (stateless, any worker on the `eval-trials` task queue):
@@ -58,16 +68,29 @@ Activities (stateless, any worker on the `eval-trials` task queue):
 | Activity | Reads | Writes (single canonical path) |
 |---|---|---|
 | `init_trial(scenario, harness, params, trial_id)` | scenario YAML, harness package, initial save state | `step_000/` |
-| `run_agent_step(step_ref)` | prior `step_<NNN>/` | next `step_<NNN+1>/` including `metrics.json` |
-| `check_milestone(step_ref, success_spec)` | `step_<NNN>/memory_dump.json` (+ previous step's, for transition predicates) | — |
+| `run_agent_step(step_ref, success_spec)` | prior `step_<NNN>/` | next `step_<NNN+1>/` including `metrics.json`. Returns `(StepMetrics, new_step_ref, milestone_reached)`. |
 | `finalize_trial(trial_id, outcome, step_ref)` | all `step_<NNN>/metrics.json` files for this trial | `<trial_id>/trial.json`, `<trial_id>/steps.jsonl` |
 | `finalize_sweep(run_id)` | all `<trial_id>/trial.json` under this run | `<run_id>/summary.jsonl` |
+
+Milestone evaluation lives inside `run_agent_step`. The activity has already produced the new `memory_dump.json` as part of writing the step directory; evaluating the success predicate against it is cheap (microseconds) and avoids a second activity round-trip per step — saving roughly 4–5 workflow-history events per step. For predicates that need the prior step's dump (e.g., `first_time`), the activity reads it from the previous `step_ref` it was passed.
 
 Activities are stateless. The PyBoy emulator is created at the start of `run_agent_step`, loaded from the prior step's save state, used to apply the harness step, then serialized back to disk along with harness internal state. The next activity invocation — possibly on a different worker — picks up from that directory.
 
 Workflow history carries only small payloads: directory path strings and a metrics dict per step. Large artifacts (screenshots, prompts, message histories, save states) live on disk under `evals/results/<run_id>/<trial_id>/step_<NNN>/`.
 
 `run_agent_step` is intentionally coarse-grained. Splitting model invocation, button application, and memory read into separate activities would force the workflow to carry the LLM response and parsed tool calls as workflow-history state. As a single activity it is idempotent at the directory boundary: a failed step retries from the previous `step_ref` and produces a fresh `step_<NNN+1>` directory.
+
+### Workflow history size and Continue-As-New
+
+Temporal records every activity input, output, and execution event in workflow history. The published soft limits are roughly 50 MB total history size and 50,000 events per execution, with strong recommendations to stay well below both. The 50-step bedroom scenario is nowhere near these limits, but longer scenarios (Brock fight, viridian forest, full Elite Four runs) easily could be.
+
+The design controls history growth with three measures:
+
+- **One activity per step**, not three. `run_agent_step` writes per-step metrics into the canonical `step_<NNN>/metrics.json` and evaluates the success predicate before returning. The workflow loop never reaches for a second activity per step.
+- **Small payloads.** Activity inputs and outputs are limited to path strings (`step_ref`), small structs (`StepMetrics`, `milestone_reached: bool`), and the scenario's success-predicate spec (~1 KB). Large per-step artifacts — screenshots, full prompts, message histories, save states — live on disk under the `step_<NNN>/` directory and never enter workflow history. This is the standard Temporal "claim check" pattern for large payloads.
+- **Continue-As-New every N steps.** `TrialWorkflow` checks `step_index % CONTINUE_AS_NEW_EVERY == 0` (default `N = 250`, tunable) and, if so, calls `workflow.continue_as_new(TrialInit(..., resume_step_ref=step_ref, resume_running_totals=totals, resume_step_index=step_index))`. The fresh workflow execution skips `init_trial` and resumes the loop from the carried `step_ref`. Running totals are carried explicitly through `TrialInit` rather than rederived, so cap checks stay accurate across the boundary. Continue-As-New also crisply caps history growth even if a scenario goes far longer than expected.
+
+For the bedroom-to-downstairs scenario (`max_steps: 50`), Continue-As-New never fires. For a hypothetical 2000-step trial, the workflow rolls over eight times, each rollover starting a fresh history of ≤250 steps' worth of events.
 
 ### Activity idempotence
 
