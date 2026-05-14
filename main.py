@@ -4,14 +4,17 @@ import os
 
 from agent.simple_agent import SimpleAgent
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(tui: bool) -> None:
+    fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    if tui:
+        # Keep stdout clean for the TUI; route logs to a file.
+        handlers = [logging.FileHandler("porygon.log", mode="w")]
+    else:
+        handlers = [logging.StreamHandler()]
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
 
 def main():
     parser = argparse.ArgumentParser(description="Claude Plays Pokemon - Starter Version")
@@ -44,13 +47,19 @@ def main():
         help="Maximum number of messages in history before summarization"
     )
     parser.add_argument(
-        "--load-state", 
-        type=str, 
-        default=None, 
+        "--load-state",
+        type=str,
+        default=None,
         help="Path to a saved state to load"
     )
-    
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Render a live terminal UI showing Claude's reasoning, actions, and cost"
+    )
+
     args = parser.parse_args()
+    setup_logging(args.tui)
     
     # Get absolute path to ROM
     if not os.path.isabs(args.rom):
@@ -65,6 +74,11 @@ def main():
         print("Place the ROM in the root directory or specify its path with --rom.")
         return
     
+    display = None
+    if args.tui:
+        from agent.tui import Display
+        display = Display()
+
     # Create and run agent
     agent = SimpleAgent(
         rom_path=rom_path,
@@ -72,8 +86,11 @@ def main():
         sound=args.sound if args.display else False,
         max_history=args.max_history,
         load_state=args.load_state,
+        display=display,
     )
-    
+
+    if display:
+        display.start()
     try:
         logger.info(f"Starting agent for {args.steps} steps")
         steps_completed = agent.run(num_steps=args.steps)
@@ -84,6 +101,8 @@ def main():
         logger.error(f"Error running agent: {e}")
     finally:
         agent.stop()
+        if display:
+            display.stop()
 
 if __name__ == "__main__":
     main()

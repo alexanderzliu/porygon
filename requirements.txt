@@ -5,3 +5,6 @@ pyboy==2.2.0       # For Pokemon emulator
 # Image processing
 Pillow             # For image manipulation
 numpy>=1.26,<2     # For array operations (pyboy 2.2.0 needs numpy 1.x ABI)
+
+# TUI
+rich>=13.7
