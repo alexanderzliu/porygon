@@ -151,6 +151,7 @@ evals/
 ├── worker.py              # `python -m evals.worker` registers workflows + activities
 ├── cli.py                 # `python -m evals run <suite>` | `inspect <trial>` | `replay <trial>`
 ├── predicates.py          # built-in predicate implementations + composition
+├── pricing.py             # centralized usage → USD mapping; sole owner of pricing rates
 ├── scenarios/
 │   └── bedroom_to_downstairs.yaml
 ├── harnesses/             # plugins; one directory per harness id
@@ -205,11 +206,29 @@ class RunningTotals:
     wall_seconds: float
 
 @dataclass
+class ModelUsage:
+    provider: str                   # "bedrock", "anthropic", etc.
+    model_id: str                   # canonical model identifier or inference-profile ARN
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    request_id: str | None = None
+    latency_ms: int | None = None
+
+class UsageMeter(Protocol):
+    """Provided by the runner via StepContext. Harness calls .record(...) after every model call.
+    The meter accumulates usage and is the single source of truth for token totals and cost
+    computation; harnesses never compute cost themselves."""
+    def record(self, usage: ModelUsage) -> None: ...
+
+@dataclass
 class StepContext:
     emulator: Emulator
     step_index: int
     running_totals: RunningTotals
     workdir: Path                       # step_<NNN+1>.partial/ — harness writes artifacts here as produced
+    usage_meter: UsageMeter             # harness calls .record(...) after every model call this step
 
 @dataclass
 class Action:
@@ -271,7 +290,16 @@ Harnesses write their per-step artifacts (prompt, response, screenshot, subagent
 
 ### Token and cost accounting
 
-Harnesses report aggregated `StepMetrics` per step. A subagent step that makes four internal model calls reports `model_calls=4` with summed token counts. Cost is computed by the harness from token counts and the model's pricing — the harness knows which model(s) it called.
+Cost computation is centralized in `evals/pricing.py`; harnesses never compute cost themselves. The flow:
+
+1. After every model call, the harness calls `ctx.usage_meter.record(ModelUsage(provider, model_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, request_id, latency_ms))`. For a subagent harness with multiple model calls per step, the meter is called once per call.
+2. At step end, the runner reads the meter and produces both the aggregated `StepMetrics` token fields (`model_calls`, `input_tokens`, ..., `cache_creation_tokens`) and the raw `usage: list[ModelUsage]` recorded for the step.
+3. The runner asks `pricing.compute_cost(usage_list)` for the dollar figure and writes it into `StepMetrics.cost_usd`.
+4. The raw `usage: list[ModelUsage]` is persisted in `step_<NNN>/metrics.json` alongside the cost-and-tokens summary. This lets us re-derive cost later under updated pricing without re-running anything.
+
+This means: harnesses report *what was used*; pricing.py owns *how it costs*. Bedrock cache-read discount changes, new model rates, or pricing-table bugs are fixed in one place, and re-running `finalize_trial` (or a small offline script) regenerates `cost_usd` everywhere from the persisted raw usage.
+
+`trial.json` records `pricing_version` (a stable string identifying the pricing table revision used) so it's unambiguous which rates produced the recorded `cost_usd`.
 
 ## Scenario schema
 
@@ -352,6 +380,9 @@ Work counters (because "one step" means different things across harnesses):
 Action trace (replaces the prior `list[str]`):
 - `actions: list[Action]` — typed trace of every action applied this step; each entry records `kind`, raw `args`, expanded `buttons`, `frames_elapsed`, optional `success` and `result_text` for actions that can fail (e.g., a navigate_to that hit a wall)
 
+Raw usage (for re-pricing later under updated rates):
+- `usage: list[ModelUsage]` — one entry per model call this step (provider, model_id, token streams, optional request_id and latency_ms)
+
 Bookkeeping:
 - `milestone_reached: bool` — cached predicate result; consumed by the activity retry short-circuit
 - `step_ref` — path to `step_<NNN>/` for cross-referencing
@@ -361,6 +392,7 @@ Each `trial.json` records:
 - `trial_id`, `run_id`, `scenario_id`, `harness_id`, `harness_version`, `trial_index`
 - `params_resolved` — the final merged params dict
 - `harness_static_config` — from `Harness.static_config()`
+- `pricing_version` — identifier of the `pricing.py` rate table used to compute `cost_usd`
 - `outcome` — `milestone_reached` | `step_cap` | `time_cap` | `cost_cap` | `error`
 - `steps_to_milestone` (null if not reached) — the primary comparison metric across harnesses
 - Aggregates across the trial: totals for `model_calls`, `decision_count`, `tool_call_count`, `button_press_count`, `emulated_frames`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `wall_ms`, `summarization_events`
@@ -398,7 +430,7 @@ Phase 3 is the unblocking milestone. Phases 5–6 add durability and parallelism
 
 ## Open questions
 
-- Pricing source for cost computation. Hardcode Bedrock list prices per model in a `pricing.py` table, or pull from somewhere? Hardcoding is fine for now; the cost field is an estimate marked `estimated_cost_usd` everywhere.
+- Pricing-table refresh cadence. `evals/pricing.py` starts with hardcoded Bedrock list prices keyed by `(provider, model_id)`, with a `PRICING_VERSION` string bumped on every edit. Open question: do we want a tiny script that re-derives `cost_usd` across all historical `metrics.json` files when pricing changes, or is recording `pricing_version` per trial enough? Defer.
 - Whether `agent/harness.py` or `evals/harness_api.py` is the right home for the protocol types. Defer to implementation taste — the import graph will decide.
 - Default `concurrency` when running under Temporal. Will depend on Bedrock rate limits and PyBoy CPU footprint. Pick empirically after phase 5.
 
