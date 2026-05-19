@@ -1,0 +1,10 @@
+id: bedroom_to_downstairs
+description: From the bedroom on 2F, reach 1F of Red's house for the first time.
+initial_state: states/after_names_bedroom.state
+success:
+  all:
+    - location_eq: REDS_HOUSE_1F
+limits:
+  max_steps: 50
+  max_seconds: 600
+  max_usd: 2.00
