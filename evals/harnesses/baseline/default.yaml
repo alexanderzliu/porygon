@@ -1,0 +1,12 @@
+model:
+  name: arn:aws:bedrock:us-east-1:651818016290:application-inference-profile/kzx60kroqtkq
+  temperature: 1.0
+  max_tokens: 4000
+aws:
+  region: us-east-1
+history:
+  max_history: 30
+navigator:
+  enabled: false
+screenshot:
+  upscale: 2
