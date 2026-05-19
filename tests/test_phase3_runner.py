@@ -145,9 +145,22 @@ class Phase3RunnerTests(unittest.TestCase):
             self.assertTrue(metrics["milestone_reached"])
             self.assertEqual(len(steps), 1)
 
+            before = json.loads((trial_dir / "trial.json").read_text())
             finalize_trial(trial_dir)
             finalize_trial(trial_dir)
+            after = json.loads((trial_dir / "trial.json").read_text())
             self.assertEqual(len((trial_dir / "steps.jsonl").read_text().splitlines()), 1)
+            for key in (
+                "run_id",
+                "trial_id",
+                "scenario_id",
+                "harness_id",
+                "outcome",
+                "scenario_sha256",
+                "rom_sha256",
+                "params_sha256",
+            ):
+                self.assertEqual(after.get(key), before.get(key), f"{key} changed across re-finalize")
 
     def test_initial_success_finishes_without_step(self):
         with tempfile.TemporaryDirectory() as tmp:

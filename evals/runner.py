@@ -305,6 +305,17 @@ def finalize_trial(
     harness_static_config: dict[str, Any] | None = None,
 ) -> None:
     trial_dir = Path(trial_dir)
+    existing = _read_existing_trial(trial_dir)
+    if spec is None:
+        spec = _spec_from_disk(trial_dir)
+    if existing is not None:
+        if outcome is None:
+            outcome = existing.get("outcome")
+        if error is None:
+            error = existing.get("error")
+        if harness_static_config is None:
+            harness_static_config = existing.get("harness_static_config")
+
     metrics = _canonical_step_metrics(trial_dir)
     with (trial_dir / "steps.jsonl").open("w", encoding="utf-8") as steps_file:
         for step_metrics in metrics:
@@ -454,6 +465,41 @@ def _canonical_step_metrics(trial_dir: Path) -> list[dict[str, Any]]:
         if metrics_path.exists():
             rows.append(_read_json(metrics_path))
     return rows
+
+
+def _read_existing_trial(trial_dir: Path) -> dict[str, Any] | None:
+    path = trial_dir / "trial.json"
+    if not path.exists():
+        return None
+    try:
+        return _read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _spec_from_disk(trial_dir: Path) -> ResolvedTrialSpec | None:
+    path = trial_dir / "resolved_trial.json"
+    if not path.exists():
+        return None
+    data = _read_json(path)
+    harness = data.get("harness") or {}
+    return ResolvedTrialSpec(
+        scenario_path=Path(data["scenario_path"]),
+        scenario_id=data["scenario_id"],
+        description=data["description"],
+        initial_state=Path(data["initial_state"]),
+        success=data.get("success") or {},
+        limits=data.get("limits") or {},
+        harness=ResolvedHarnessConfig(
+            id=harness.get("id", ""),
+            params=harness.get("params") or {},
+        ),
+        rom_path=Path(data["rom_path"]),
+        results_root=trial_dir.parent.parent,
+        run_id=data["run_id"],
+        trial_index=int(data.get("trial_index", 0)),
+        trial_id=data["trial_id"],
+    )
 
 
 def _freeze_inputs(spec: ResolvedTrialSpec, trial_dir: Path) -> None:
