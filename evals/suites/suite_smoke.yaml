@@ -1,0 +1,9 @@
+scenario: bedroom_to_downstairs
+trials: 2
+concurrency: 1
+matrix:
+  - harness: baseline
+  - harness: baseline
+    params_override:
+      model:
+        temperature: 0.5

@@ -202,8 +202,11 @@ def init_trial(
 ) -> tuple[StepRef, bool]:
     step_ref = StepRef(step_index=0, path=trial_dir / "step_000")
     if step_ref.path.exists():
-        memory_dump = _read_memory_dump(step_ref.path / "memory_dump.json")
-        return step_ref, evaluate_predicate(spec.success, memory_dump)
+        memory_path = step_ref.path / "memory_dump.json"
+        if memory_path.exists():
+            memory_dump = _read_memory_dump(memory_path)
+            return step_ref, evaluate_predicate(spec.success, memory_dump)
+        shutil.rmtree(step_ref.path)
 
     if not spec.initial_state.exists():
         raise FileNotFoundError(f"Initial eval state not found: {spec.initial_state}")
@@ -356,7 +359,7 @@ def _new_emulator(spec: ResolvedTrialSpec):
 
     from agent.emulator import Emulator
 
-    emulator = Emulator(spec.rom_path, headless=True, sound=False)
+    emulator = Emulator(str(spec.rom_path), headless=True, sound=False)
     emulator.initialize()
     return emulator
 
@@ -617,12 +620,22 @@ def _parse_simple_yaml(text: str) -> Any:
                 key, _, raw_value = item.partition(":")
                 raw_value = raw_value.strip()
                 if raw_value:
-                    result.append({key: _parse_scalar(raw_value)})
+                    value = {key: _parse_scalar(raw_value)}
                 elif index < len(lines) and lines[index][0] > line_indent:
-                    value, index = parse_block(index, lines[index][0])
-                    result.append({key: value})
+                    nested, index = parse_block(index, lines[index][0])
+                    value = {key: nested}
                 else:
-                    result.append({key: {}})
+                    value = {key: {}}
+
+                if index < len(lines) and lines[index][0] > line_indent:
+                    continuation, index = parse_block(index, lines[index][0])
+                    if isinstance(value, dict) and isinstance(continuation, dict):
+                        value = _deep_merge(value, continuation)
+                    else:
+                        raise ValueError(
+                            f"Unexpected YAML list continuation near: {content}"
+                        )
+                result.append(value)
             else:
                 result.append(_parse_scalar(item))
         return result, index
@@ -646,6 +659,8 @@ def _parse_scalar(value: str) -> Any:
         if not inner:
             return []
         return [_parse_scalar(part.strip()) for part in inner.split(",")]
+    if value.startswith("{") and value.endswith("}"):
+        return _parse_flow_mapping(value[1:-1])
     if (
         (value.startswith('"') and value.endswith('"'))
         or (value.startswith("'") and value.endswith("'"))
@@ -659,6 +674,52 @@ def _parse_scalar(value: str) -> Any:
         return float(value)
     except ValueError:
         return value
+
+
+def _parse_flow_mapping(text: str) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for item in _split_flow_items(text):
+        key, sep, raw_value = item.partition(":")
+        if not sep:
+            raise ValueError(f"Expected YAML flow mapping entry near: {item}")
+        result[_strip_quotes(key.strip())] = _parse_scalar(raw_value.strip())
+    return result
+
+
+def _split_flow_items(text: str) -> list[str]:
+    items = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            item = text[start:index].strip()
+            if item:
+                items.append(item)
+            start = index + 1
+    final_item = text[start:].strip()
+    if final_item:
+        items.append(final_item)
+    return items
+
+
+def _strip_quotes(value: str) -> str:
+    if (
+        (value.startswith('"') and value.endswith('"'))
+        or (value.startswith("'") and value.endswith("'"))
+    ):
+        return value[1:-1]
+    return value
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

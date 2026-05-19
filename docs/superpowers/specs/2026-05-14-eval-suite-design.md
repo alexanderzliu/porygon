@@ -37,16 +37,18 @@ The first scenario we want to run is the inspiring example: from the post-naming
 
 ```
 SweepWorkflow                    # one per `evals run <suite.yaml>` invocation
-  │  expands suite into (scenario × harness × trial_i) cells
+  │  receives a frozen resolved suite from the CLI
+  │  expands it into (scenario × harness × trial_i) cells
   │  fans out child workflows, bounded by concurrency cap
   │
   ▼
-TrialWorkflow(trial_id, scenario_id, harness_id, params_override, trial_index,
+TrialWorkflow(resolved_trial_spec, trial_index,
               [resume_step_ref, resume_running_totals, resume_step_index])
   │  if not resuming:
-  │      step_ref = await init_trial(...)              # writes step_000/
+  │      step_ref, milestone_reached = await init_trial(...)  # writes step_000/, evaluates success
+  │      if milestone_reached: jump to finalize_trial (no model call charged)
   │  loop:
-  │      result = await run_agent_step(step_ref, scenario.success_spec)
+  │      result = await run_agent_step(step_ref, resolved_trial_spec.success_spec)
   │                                                   # writes step_<NNN+1>/ incl. metrics.json,
   │                                                   # evaluates success predicate as part of the step,
   │                                                   # returns (StepMetrics, new_step_ref, milestone_reached)
@@ -54,9 +56,9 @@ TrialWorkflow(trial_id, scenario_id, harness_id, params_override, trial_index,
   │      update running_totals
   │      if result.milestone_reached: break
   │      if exceeded caps: break
-  │      if step_index % CONTINUE_AS_NEW_EVERY == 0:
+  │      if completed_steps > 0 and completed_steps % CONTINUE_AS_NEW_EVERY == 0:
   │          workflow.continue_as_new(TrialInit(..., resume_step_ref=step_ref,
-  │                                              resume_running_totals=..., resume_step_index=step_index))
+  │                                              resume_running_totals=..., resume_step_index=completed_steps))
   │  await finalize_trial(trial_id, outcome, step_ref)  # writes trial.json + regenerates steps.jsonl
 
 SweepWorkflow tail:
@@ -67,12 +69,25 @@ Activities (stateless, any worker on the `eval-trials` task queue):
 
 | Activity | Reads | Writes (single canonical path) |
 |---|---|---|
-| `init_trial(scenario, harness, params, trial_id)` | scenario YAML, harness package, initial save state | `step_000/` |
+| `init_trial(resolved_trial_spec)` | frozen resolved scenario, harness id/version, params, initial save-state path | `step_000/` (incl. `harness_state.bin` and an initial `memory_dump.json`). Returns `(step_ref, milestone_reached)` — evaluates the success predicate against the initial memory dump so trials that already satisfy success at the start are not charged for a model call. |
 | `run_agent_step(step_ref, success_spec)` | prior `step_<NNN>/` | next `step_<NNN+1>/` including `metrics.json`. Returns `(StepMetrics, new_step_ref, milestone_reached)`. |
 | `finalize_trial(trial_id, outcome, step_ref)` | all `step_<NNN>/metrics.json` files for this trial | `<trial_id>/trial.json`, `<trial_id>/steps.jsonl` |
 | `finalize_sweep(run_id)` | all `<trial_id>/trial.json` under this run | `<run_id>/summary.jsonl` |
 
-Milestone evaluation lives inside `run_agent_step`. The activity has already produced the new `memory_dump.json` as part of writing the step directory; evaluating the success predicate against it is cheap (microseconds) and avoids a second activity round-trip per step — saving roughly 4–5 workflow-history events per step. For predicates that need the prior step's dump (e.g., `first_time`), the activity reads it from the previous `step_ref` it was passed.
+### Resolved specs and workflow inputs
+
+The CLI resolves all mutable input files before starting Temporal:
+
+- suite YAML
+- scenario YAML
+- harness default params and any selected alternate params file
+- params overrides after deep-merge
+- initial save-state path and content hash
+- ROM path/hash, PyBoy version, Python version, git commit/dirty flag, and pricing version
+
+The resolved suite is copied to `evals/results/<run_id>/suite.yaml` and passed to `SweepWorkflow` as immutable data. Workflows never read YAML files, import harness packages, or inspect the filesystem while making control-flow decisions. Activities may import harness code and read artifact files/save states, but they use the frozen resolved trial spec carried by the workflow rather than re-reading mutable scenario or suite YAML on retry.
+
+Milestone evaluation lives inside `init_trial` for `step_000` and inside `run_agent_step` for every later step. By the time either activity evaluates the predicate, it has already produced the relevant `memory_dump.json`; evaluating the success predicate against it is cheap (microseconds) and avoids a second activity round-trip per step — saving roughly 4–5 workflow-history events per step. For predicates that need the prior step's dump (e.g., `first_time`), `run_agent_step` reads it from the previous `step_ref` it was passed.
 
 Activities are stateless. The PyBoy emulator is created at the start of `run_agent_step`, loaded from the prior step's save state, used to apply the harness step, then serialized back to disk along with harness internal state. The next activity invocation — possibly on a different worker — picks up from that directory.
 
@@ -88,7 +103,7 @@ The design controls history growth with three measures:
 
 - **One activity per step**, not three. `run_agent_step` writes per-step metrics into the canonical `step_<NNN>/metrics.json` and evaluates the success predicate before returning. The workflow loop never reaches for a second activity per step.
 - **Small payloads.** Activity inputs and outputs are limited to path strings (`step_ref`), small structs (`StepMetrics`, `milestone_reached: bool`), and the scenario's success-predicate spec (~1 KB). Large per-step artifacts — screenshots, full prompts, message histories, save states — live on disk under the `step_<NNN>/` directory and never enter workflow history. This is the standard Temporal "claim check" pattern for large payloads.
-- **Continue-As-New every N steps.** `TrialWorkflow` checks `step_index % CONTINUE_AS_NEW_EVERY == 0` (default `N = 250`, tunable) and, if so, calls `workflow.continue_as_new(TrialInit(..., resume_step_ref=step_ref, resume_running_totals=totals, resume_step_index=step_index))`. The fresh workflow execution skips `init_trial` and resumes the loop from the carried `step_ref`. Running totals are carried explicitly through `TrialInit` rather than rederived, so cap checks stay accurate across the boundary. Continue-As-New also crisply caps history growth even if a scenario goes far longer than expected.
+- **Continue-As-New every N completed steps.** After incrementing the completed-step count, `TrialWorkflow` checks `completed_steps > 0 and completed_steps % CONTINUE_AS_NEW_EVERY == 0` (default `N = 250`, tunable) and, if so, calls `workflow.continue_as_new(TrialInit(..., resume_step_ref=step_ref, resume_running_totals=totals, resume_step_index=completed_steps))`. The fresh workflow execution skips `init_trial` and resumes the loop from the carried `step_ref`. Running totals are carried explicitly through `TrialInit` rather than rederived, so cap checks stay accurate across the boundary. Continue-As-New also crisply caps history growth even if a scenario goes far longer than expected.
 
 For the bedroom-to-downstairs scenario (`max_steps: 50`), Continue-As-New never fires. For a hypothetical 2000-step trial, the workflow rolls over eight times, each rollover starting a fresh history of ≤250 steps' worth of events.
 
@@ -101,15 +116,15 @@ Temporal retries activities on transient failures. Two classes of problem to avo
 
 The protocol for `run_agent_step(step_ref, success_spec)`:
 
-1. **Completion check.** If `<step_dir>/state.bin` exists (where `<step_dir>` is `step_<NNN+1>/`), the step is already canonical. Load `metrics.json`, re-evaluate the success predicate against the recorded `memory_dump.json`, return — no LLM call, no emulator load.
-2. **Partial-directory setup.** Otherwise, ensure a clean working directory at `step_<NNN+1>.partial/`. A stale partial from a crashed prior attempt is deleted by default. (Harnesses that opt into mid-step resume — see below — can choose to reuse it instead.)
-3. **Harness execution with incremental artifacts.** The activity loads `step_<NNN>/state.bin` into PyBoy, restores harness internal state from `step_<NNN>/harness_state.bin`, and calls `harness.step(ctx)` with `ctx.workdir = step_<NNN+1>.partial/`. The harness is required to write each artifact as soon as it is produced:
+1. **Completion check.** If the canonical directory `step_<NNN+1>/` exists, the step is already canonical. The directory is only ever materialized atomically (step 5), so its presence guarantees the full required-file set: `harness_state.bin`, `metrics.json`, `state.bin`, and the harness-produced artifacts from step 3. Load `metrics.json` and return its persisted `milestone_reached` value — no LLM call, no emulator load, no predicate re-evaluation on the normal path. Debug tooling may optionally re-evaluate the predicate against the recorded `memory_dump.json` to catch corrupted artifacts or predicate implementation changes. (We keep `state.bin` as the last byte written into the partial in step 4 so the canonical directory can never appear half-populated even if a future change moves to per-file publish.)
+2. **Partial-directory setup.** Otherwise, derive an attempt-scoped working directory at `step_<NNN+1>.partial.attempt_<A>/`, where `A = activity.info().attempt` (Temporal increments this on every retry). This isolates concurrent attempts: a timed-out attempt may keep running on its original worker while Temporal schedules a retry, and an unscoped `step_<NNN+1>.partial/` would let one attempt delete or overwrite the other's artifacts mid-flight. The current attempt removes only its own attempt-scoped partial on entry; partials from other attempt numbers are left untouched and cleaned up later by `finalize_trial`. (Harnesses that opt into mid-step resume — see below — can choose to reuse the current attempt's partial instead of clearing it.)
+3. **Harness execution with incremental artifacts.** The activity loads `step_<NNN>/state.bin` into PyBoy, restores harness internal state from `step_<NNN>/harness_state.bin`, and calls `harness.step(ctx)` with `ctx.workdir = step_<NNN+1>.partial.attempt_<A>/`. The harness is required to write each artifact as soon as it is produced:
    - `prompt.json` before the model call
    - `response.json` (with token counts) immediately after the model call, before applying emulator actions
    - `screenshot.png`, `memory_dump.json`, `collision_map.txt` after action execution
    - any harness-specific artifacts (subagent traces, planner state) as they are produced
-4. **Activity-side finalization.** After `harness.step()` returns, the activity writes `metrics.json` and then `state.bin` into `step_<NNN+1>.partial/`. `state.bin` is written last and acts as the commit marker.
-5. **Atomic publish.** `os.rename(step_<NNN+1>.partial, step_<NNN+1>)`. On POSIX filesystems this is atomic; either the directory exists at its canonical name with all artifacts, or it does not. The presence of `step_<NNN+1>/state.bin` is the unambiguous signal that the step is complete.
+4. **Activity-side finalization.** After `harness.step()` returns, the activity writes — in order — `harness_state.bin = harness.serialize_state()`, then `metrics.json`, then `state.bin` into the attempt-scoped partial directory. `state.bin` is written last and acts as the commit marker; combined with the atomic rename in step 5, this guarantees the canonical directory either does not exist or contains the full required-file set. The required-file set for a complete step is `{harness_state.bin, metrics.json, state.bin}` plus the harness artifacts from step 3.
+5. **Atomic publish-if-absent.** Attempt `os.rename(step_<NNN+1>.partial.attempt_<A>, step_<NNN+1>)`. On POSIX this rename is atomic and fails with `ENOTEMPTY` / `EEXIST` if the canonical directory already exists — which is exactly the case when a concurrent attempt won the race. On that failure the current attempt `rmtree`'s its own partial, reads `metrics.json` from the canonical directory, and returns the winning attempt's result. Otherwise the rename succeeds and the canonical directory is now visible to all subsequent attempts.
 6. **Return.** `(StepMetrics, new_step_ref, milestone_reached)`. `milestone_reached` is also persisted in `metrics.json` so the short-circuit path can read it without re-evaluating.
 
 **What this gives us, honestly:**
@@ -120,12 +135,12 @@ The protocol for `run_agent_step(step_ref, success_spec)`:
 
 **Harness-level mid-step resume (extension point, not required for v1).**
 
-Baseline-shaped harnesses make exactly one model call per step, so a future v2 could implement mid-step resume: on retry-into-partial, if `prompt.json` and `response.json` already exist in the partial directory, skip the model call and replay action execution against the loaded PyBoy state. This avoids paying for the inference twice.
+Baseline-shaped harnesses make exactly one model call per step, so a future v2 could implement mid-step resume: when a new attempt starts, it can scan for any sibling `step_<NNN+1>.partial.attempt_<*>/` directories from earlier attempts of the same step and, if one contains a `prompt.json` and `response.json`, adopt that pair to skip the model call and replay action execution against the loaded PyBoy state. This avoids paying for the inference twice. (The attempt-scoping in step 2 above already keeps the prior attempts' artifacts intact; v1 ignores them and v2 would look at them.)
 
 Subagent harnesses with multiple internal model calls per step would need to checkpoint between sub-calls — that requires opt-in from the harness because the protocol can't infer where the safe restart points are. We expose this as a future affordance rather than building it now:
 
-- `StepContext.workdir` (the partial directory) is passed to the harness, giving it a place to persist intermediate state cheaply.
-- A future addition to the `Harness` protocol could be a `resume_from(workdir)` hook called when the activity detects a non-empty partial. v1 simply deletes stale partials.
+- `StepContext.workdir` (the current attempt's partial directory) is passed to the harness, giving it a place to persist intermediate state cheaply.
+- A future addition to the `Harness` protocol could be a `resume_from(prior_workdirs)` hook called when the activity detects sibling partials from earlier attempts. v1 ignores other attempts' partials and only clears its own.
 
 For v1 (phases 1–5 below), only the completion-check / atomic-publish properties are mandatory. Mid-step resume is deferred to a later phase if cost duplication on rare crashes turns out to matter.
 
@@ -147,7 +162,7 @@ evals/
 ├── __init__.py
 ├── runner.py              # local single-trial runner (no Temporal)
 ├── workflows.py           # SweepWorkflow, TrialWorkflow
-├── activities.py          # init_trial, run_agent_step, check_milestone, record_step, finalize_trial
+├── activities.py          # init_trial, run_agent_step, finalize_trial, finalize_sweep
 ├── worker.py              # `python -m evals.worker` registers workflows + activities
 ├── cli.py                 # `python -m evals run <suite>` | `inspect <trial>` | `replay <trial>`
 ├── predicates.py          # built-in predicate implementations + composition
@@ -227,7 +242,7 @@ class StepContext:
     emulator: Emulator
     step_index: int
     running_totals: RunningTotals
-    workdir: Path                       # step_<NNN+1>.partial/ — harness writes artifacts here as produced
+    workdir: Path                       # step_<NNN+1>.partial.attempt_<A>/ — harness writes artifacts here as produced
     usage_meter: UsageMeter             # harness calls .record(...) after every model call this step
 
 @dataclass
@@ -241,6 +256,10 @@ class Action:
 
 @dataclass
 class StepMetrics:
+    # Runner-owned canonical record. Harnesses do not construct this directly;
+    # the runner builds it from StepResult, UsageMeter, wall clock, predicates,
+    # and the final step_ref.
+
     # Cost and effort accounting
     model_calls: int                # total model invocations this step (includes subagent calls)
     input_tokens: int
@@ -256,13 +275,22 @@ class StepMetrics:
     button_press_count: int         # raw GB buttons applied to the emulator (post-expansion)
     emulated_frames: int            # PyBoy frame-count delta over the step
 
+    actions: list[Action]           # typed trace of every action applied this step
+    usage: list[ModelUsage]         # raw usage records used to compute token totals and cost
+    step_ref: str                   # path to step_<NNN>/ for cross-referencing
+
     summarization_events: int = 0
     milestone_reached: bool = False # persisted in metrics.json; read on retry short-circuit
 
 @dataclass
+class StepCounters:
+    tool_call_count: int                    # total tool invocations across all internal model calls
+    summarization_events: int = 0
+
+@dataclass
 class StepResult:
-    actions: list[Action]                   # typed trace of every action applied this step
-    metrics: StepMetrics
+    actions: list[Action]                   # typed trace of every emulator-affecting action applied this step
+    counters: StepCounters                  # harness-owned counters that cannot be derived from actions/usage
     text_log: str                           # human-readable trace for this step
     # All persistent artifacts (prompts, responses, screenshots, subagent traces, etc.)
     # are written by the harness directly into ctx.workdir as they are produced,
@@ -293,8 +321,8 @@ Harnesses write their per-step artifacts (prompt, response, screenshot, subagent
 Cost computation is centralized in `evals/pricing.py`; harnesses never compute cost themselves. The flow:
 
 1. After every model call, the harness calls `ctx.usage_meter.record(ModelUsage(provider, model_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, request_id, latency_ms))`. For a subagent harness with multiple model calls per step, the meter is called once per call.
-2. At step end, the runner reads the meter and produces both the aggregated `StepMetrics` token fields (`model_calls`, `input_tokens`, ..., `cache_creation_tokens`) and the raw `usage: list[ModelUsage]` recorded for the step.
-3. The runner asks `pricing.compute_cost(usage_list)` for the dollar figure and writes it into `StepMetrics.cost_usd`.
+2. At step end, the runner reads the meter and the harness's `StepResult`, then produces both the aggregated `StepMetrics` token fields (`model_calls`, `input_tokens`, ..., `cache_creation_tokens`) and the raw `usage: list[ModelUsage]` recorded for the step.
+3. The runner asks `pricing.compute_cost(usage_list)` for the dollar figure and writes it into `StepMetrics.cost_usd`. It also derives `decision_count`, `button_press_count`, and `emulated_frames` from `StepResult.actions`, copies `tool_call_count` and `summarization_events` from `StepResult.counters`, and stores the action trace in `StepMetrics.actions`.
 4. The raw `usage: list[ModelUsage]` is persisted in `step_<NNN>/metrics.json` alongside the cost-and-tokens summary. This lets us re-derive cost later under updated pricing without re-running anything.
 
 This means: harnesses report *what was used*; pricing.py owns *how it costs*. Bedrock cache-read discount changes, new model rates, or pricing-table bugs are fixed in one place, and re-running `finalize_trial` (or a small offline script) regenerates `cost_usd` everywhere from the persisted raw usage.
@@ -341,7 +369,7 @@ The sweep expands the matrix into `len(matrix) × trials` trial workflows.
 
 ## Milestone predicate DSL
 
-YAML in a scenario's `success` field. Evaluated by `check_milestone` against a `MemoryDump` (and optionally the prior step's `MemoryDump`, for transition predicates).
+YAML in a scenario's `success` field. Evaluated by the predicate evaluator inside `init_trial` and `run_agent_step` against a `MemoryDump` (and optionally the prior step's `MemoryDump`, for transition predicates).
 
 | Predicate | Reads | Example |
 |---|---|---|
@@ -393,6 +421,7 @@ Each `trial.json` records:
 - `params_resolved` — the final merged params dict
 - `harness_static_config` — from `Harness.static_config()`
 - `pricing_version` — identifier of the `pricing.py` rate table used to compute `cost_usd`
+- Reproducibility metadata from the resolved trial spec: ROM SHA256, initial state SHA256, scenario hash, params hash, PyBoy version, Python version, git commit, and dirty-worktree flag
 - `outcome` — `milestone_reached` | `step_cap` | `time_cap` | `cost_cap` | `error`
 - `steps_to_milestone` (null if not reached) — the primary comparison metric across harnesses
 - Aggregates across the trial: totals for `model_calls`, `decision_count`, `tool_call_count`, `button_press_count`, `emulated_frames`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, `wall_ms`, `summarization_events`
