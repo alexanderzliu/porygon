@@ -4,7 +4,7 @@ import pickle
 from collections import deque
 import heapq
 
-from agent.memory_reader import PokemonRedReader, StatusCondition
+from agent.memory_reader import MemoryDump, PokemonRedReader
 from PIL import Image
 from pyboy import PyBoy
 
@@ -489,52 +489,14 @@ class Emulator:
         """
         Reads the game state from memory and returns a string representation of it.
         """
+        return self.get_memory_dump().format()
+
+    def get_memory_dump(self) -> MemoryDump:
+        """
+        Reads the game state from memory and returns a structured representation.
+        """
         reader = PokemonRedReader(self.pyboy.memory)
-        memory_str = ""
-
-        name = reader.read_player_name()
-        if name == "NINTEN":
-            name = "Not yet set"
-        rival_name = reader.read_rival_name()
-        if rival_name == "SONY":
-            rival_name = "Not yet set"
-
-        # Get valid moves
-        valid_moves = self.get_valid_moves()
-        valid_moves_str = ", ".join(valid_moves) if valid_moves else "None"
-
-        memory_str += f"Player: {name}\n"
-        memory_str += f"Rival: {rival_name}\n"
-        memory_str += f"Money: ${reader.read_money()}\n"
-        memory_str += f"Location: {reader.read_location()}\n"
-        memory_str += f"Coordinates: {reader.read_coordinates()}\n"
-        memory_str += f"Valid Moves: {valid_moves_str}\n"
-        memory_str += f"Badges: {', '.join(reader.read_badges())}\n"
-
-        # Inventory
-        memory_str += "Inventory:\n"
-        for item, qty in reader.read_items():
-            memory_str += f"  {item} x{qty}\n"
-
-        # Dialog
-        dialog = reader.read_dialog()
-        if dialog:
-            memory_str += f"Dialog: {dialog}\n"
-        else:
-            memory_str += "Dialog: None\n"
-
-        # Party Pokemon
-        memory_str += "\nPokemon Party:\n"
-        for pokemon in reader.read_party_pokemon():
-            memory_str += f"\n{pokemon.nickname} ({pokemon.species_name}):\n"
-            memory_str += f"Level {pokemon.level} - HP: {pokemon.current_hp}/{pokemon.max_hp}\n"
-            memory_str += f"Types: {pokemon.type1.name}{', ' + pokemon.type2.name if pokemon.type2 else ''}\n"
-            for move, pp in zip(pokemon.moves, pokemon.move_pp, strict=True):
-                memory_str += f"- {move} (PP: {pp})\n"
-            if pokemon.status != StatusCondition.NONE:
-                memory_str += f"Status: {pokemon.status.get_status_name()}\n"
-
-        return memory_str
+        return reader.read_memory_dump(valid_moves=self.get_valid_moves())
 
     def stop(self):
         self.pyboy.stop()

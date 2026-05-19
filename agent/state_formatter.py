@@ -8,6 +8,8 @@ from pathlib import Path
 
 from PIL import Image
 
+from agent.memory_reader import MemoryDump
+
 
 def get_screenshot_base64(screenshot: Image.Image, upscale: int = 1) -> str:
     if upscale > 1:
@@ -24,6 +26,7 @@ class StateFeedback:
     screenshot_base64: str
     memory_info: str
     collision_map: str | None
+    memory_dump: MemoryDump | None = None
 
 
 class StateFormatter:
@@ -35,14 +38,24 @@ class StateFormatter:
         screenshot_b64 = get_screenshot_base64(
             screenshot, upscale=self.screenshot_upscale
         )
-        memory_info = emulator.get_state_from_memory()
+        memory_dump = None
+        if hasattr(emulator, "get_memory_dump"):
+            memory_dump = emulator.get_memory_dump()
+            memory_info = memory_dump.format()
+        else:
+            memory_info = emulator.get_state_from_memory()
         collision_map = emulator.get_collision_map()
 
         if workdir is not None:
             workdir.mkdir(parents=True, exist_ok=True)
             screenshot.save(workdir / "screenshot.png")
+            memory_artifact = (
+                memory_dump.to_dict()
+                if memory_dump is not None
+                else {"text": memory_info}
+            )
             (workdir / "memory_dump.json").write_text(
-                json.dumps({"text": memory_info}, indent=2), encoding="utf-8"
+                json.dumps(memory_artifact, indent=2), encoding="utf-8"
             )
             if collision_map:
                 (workdir / "collision_map.txt").write_text(
@@ -53,6 +66,7 @@ class StateFormatter:
             screenshot_base64=screenshot_b64,
             memory_info=memory_info,
             collision_map=collision_map,
+            memory_dump=memory_dump,
         )
 
     def build_tool_result(

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 
 
@@ -728,6 +728,117 @@ class PokemonData:
             return "OK"
 
 
+@dataclass
+class InventoryItem:
+    name: str
+    quantity: int
+
+
+@dataclass
+class MemoryDump:
+    player_name: str
+    rival_name: str
+    money: int
+    location: str
+    map_id: int | None
+    coordinates: tuple[int, int]
+    valid_moves: list[str]
+    badges: list[str]
+    inventory: list[InventoryItem]
+    dialog: str | None
+    party: list[PokemonData]
+    raw: dict = field(default_factory=dict)
+
+    def format(self) -> str:
+        valid_moves = ", ".join(self.valid_moves) if self.valid_moves else "None"
+        badges = ", ".join(self.badges) if self.badges else "None"
+        location = self.location.replace("_", " ")
+
+        memory_str = ""
+        memory_str += f"Player: {self.player_name}\n"
+        memory_str += f"Rival: {self.rival_name}\n"
+        memory_str += f"Money: ${self.money}\n"
+        memory_str += f"Location: {location}\n"
+        memory_str += f"Coordinates: {self.coordinates}\n"
+        memory_str += f"Valid Moves: {valid_moves}\n"
+        memory_str += f"Badges: {badges}\n"
+
+        memory_str += "Inventory:\n"
+        for item in self.inventory:
+            memory_str += f"  {item.name} x{item.quantity}\n"
+
+        if self.dialog:
+            memory_str += f"Dialog: {self.dialog}\n"
+        else:
+            memory_str += "Dialog: None\n"
+
+        memory_str += "\nPokemon Party:\n"
+        for pokemon in self.party:
+            type1 = _format_type_name(pokemon.type1)
+            type2 = _format_type_name(pokemon.type2)
+            types = type1 if type2 is None else f"{type1}, {type2}"
+
+            memory_str += f"\n{pokemon.nickname} ({pokemon.species_name}):\n"
+            memory_str += (
+                f"Level {pokemon.level} - HP: {pokemon.current_hp}/{pokemon.max_hp}\n"
+            )
+            memory_str += f"Types: {types}\n"
+            for move, pp in zip(pokemon.moves, pokemon.move_pp, strict=True):
+                memory_str += f"- {move} (PP: {pp})\n"
+            if pokemon.status != StatusCondition.NONE:
+                memory_str += f"Status: {pokemon.status.get_status_name()}\n"
+
+        return memory_str
+
+    def to_dict(self) -> dict:
+        return {
+            "player_name": self.player_name,
+            "rival_name": self.rival_name,
+            "money": self.money,
+            "location": self.location,
+            "map_id": self.map_id,
+            "coordinates": list(self.coordinates),
+            "valid_moves": list(self.valid_moves),
+            "badges": list(self.badges),
+            "inventory": [
+                {"name": item.name, "quantity": item.quantity}
+                for item in self.inventory
+            ],
+            "dialog": self.dialog,
+            "party": [_pokemon_to_dict(pokemon) for pokemon in self.party],
+            "raw": dict(self.raw),
+            "text": self.format(),
+        }
+
+
+def _format_type_name(value) -> str | None:
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    if name is not None:
+        return name
+    return str(value)
+
+
+def _pokemon_to_dict(pokemon: PokemonData) -> dict:
+    return {
+        "species_id": pokemon.species_id,
+        "species_name": pokemon.species_name,
+        "current_hp": pokemon.current_hp,
+        "max_hp": pokemon.max_hp,
+        "level": pokemon.level,
+        "status": int(pokemon.status),
+        "status_name": pokemon.status_name,
+        "type1": _format_type_name(pokemon.type1),
+        "type2": _format_type_name(pokemon.type2),
+        "moves": list(pokemon.moves),
+        "move_pp": list(pokemon.move_pp),
+        "trainer_id": pokemon.trainer_id,
+        "nickname": pokemon.nickname,
+        "experience": pokemon.experience,
+    }
+
+
 class PokemonRedReader:
     """Reads and interprets memory values from Pokemon Red"""
 
@@ -975,10 +1086,52 @@ class PokemonRedReader:
         seconds = self.memory[0xDA44]
         return (hours, minutes, seconds)
 
+    def read_map_id(self) -> int:
+        """Read current map id"""
+        return self.memory[0xD35E]
+
     def read_location(self) -> str:
         """Read current location name"""
-        map_id = self.memory[0xD35E]
+        map_id = self.read_map_id()
         return MapLocation(map_id).name.replace("_", " ")
+
+    def read_memory_dump(self, valid_moves: list[str] | None = None) -> MemoryDump:
+        """Read the structured game state needed by prompts and eval predicates."""
+        player_name = self.read_player_name()
+        if player_name == "NINTEN":
+            player_name = "Not yet set"
+
+        rival_name = self.read_rival_name()
+        if rival_name == "SONY":
+            rival_name = "Not yet set"
+
+        map_id = self.read_map_id()
+        try:
+            location = MapLocation(map_id).name
+        except ValueError:
+            location = f"UNKNOWN_{map_id:02X}"
+
+        dialog = self.read_dialog()
+        if not dialog:
+            dialog = None
+
+        return MemoryDump(
+            player_name=player_name,
+            rival_name=rival_name,
+            money=self.read_money(),
+            location=location,
+            map_id=map_id,
+            coordinates=self.read_coordinates(),
+            valid_moves=list(valid_moves or []),
+            badges=self.read_badges(),
+            inventory=[
+                InventoryItem(name=item_name, quantity=quantity)
+                for item_name, quantity in self.read_items()
+            ],
+            dialog=dialog,
+            party=self.read_party_pokemon(),
+            raw={"game_time": self.read_game_time(), "coins": self.read_coins()},
+        )
 
     def read_tileset(self) -> str:
         """Read current map's tileset name"""
