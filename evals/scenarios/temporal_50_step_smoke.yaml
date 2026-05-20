@@ -1,0 +1,9 @@
+id: temporal_50_step_smoke
+description: Temporal smoke scenario that intentionally runs to a 50-step cap without model calls.
+initial_state: states/after_names_bedroom.state
+success:
+  location_eq: IMPOSSIBLE_TEMPORAL_SMOKE_LOCATION
+limits:
+  max_steps: 50
+  max_seconds: 600
+  max_usd: 0.01

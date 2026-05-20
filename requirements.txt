@@ -1,6 +1,7 @@
 # Core requirements
 anthropic[bedrock]>=0.39.0  # For Claude API (Bedrock client)
 pyboy==2.2.0       # For Pokemon emulator
+temporalio>=1.10.0 # For durable eval workflows
 
 # Image processing
 Pillow             # For image manipulation

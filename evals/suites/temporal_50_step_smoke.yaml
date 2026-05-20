@@ -1,0 +1,5 @@
+scenario: temporal_50_step_smoke
+trials: 1
+concurrency: 1
+matrix:
+  - harness: noop

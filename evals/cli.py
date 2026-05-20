@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import json
 import shutil
@@ -13,8 +14,16 @@ from evals.runner import (
     EVALS_ROOT,
     REPO_ROOT,
     finalize_trial,
+    resolve_trial_spec,
     run_trial,
     _load_yaml,
+)
+from evals.temporal_payloads import (
+    DEFAULT_TASK_QUEUE,
+    DEFAULT_TEMPORAL_ADDRESS,
+    DEFAULT_TEMPORAL_NAMESPACE,
+    SuiteInit,
+    trial_spec_to_payload,
 )
 
 
@@ -41,12 +50,23 @@ def run_one_command(args: argparse.Namespace) -> None:
 
 
 def run_suite_command(args: argparse.Namespace) -> None:
-    run_dir = run_suite(
-        Path(args.suite),
-        run_id=args.run_id,
-        rom_path=args.rom,
-        results_root=args.results_root,
-    )
+    if args.temporal:
+        run_dir = run_suite_temporal(
+            Path(args.suite),
+            run_id=args.run_id,
+            rom_path=args.rom,
+            results_root=args.results_root,
+            address=args.temporal_address,
+            namespace=args.temporal_namespace,
+            task_queue=args.task_queue,
+        )
+    else:
+        run_dir = run_suite(
+            Path(args.suite),
+            run_id=args.run_id,
+            rom_path=args.rom,
+            results_root=args.results_root,
+        )
     rows = _read_summary_rows(run_dir)
     print(f"Run: {run_dir}")
     print(f"Trials: {len(rows)}")
@@ -119,6 +139,94 @@ def run_suite(
     return run_dir
 
 
+def run_suite_temporal(
+    suite_path: Path,
+    *,
+    run_id: str | None = None,
+    rom_path: str | Path | None = None,
+    results_root: str | Path | None = None,
+    address: str = DEFAULT_TEMPORAL_ADDRESS,
+    namespace: str = DEFAULT_TEMPORAL_NAMESPACE,
+    task_queue: str = DEFAULT_TASK_QUEUE,
+    continue_as_new_every: int = 250,
+) -> Path:
+    suite_init = resolve_suite_temporal_init(
+        suite_path,
+        run_id=run_id,
+        rom_path=rom_path,
+        results_root=results_root,
+        task_queue=task_queue,
+        continue_as_new_every=continue_as_new_every,
+    )
+    return asyncio.run(
+        _run_suite_temporal_async(
+            suite_init,
+            address=address,
+            namespace=namespace,
+            task_queue=task_queue,
+        )
+    )
+
+
+def resolve_suite_temporal_init(
+    suite_path: Path,
+    *,
+    run_id: str | None = None,
+    rom_path: str | Path | None = None,
+    results_root: str | Path | None = None,
+    task_queue: str = DEFAULT_TASK_QUEUE,
+    continue_as_new_every: int = 250,
+) -> SuiteInit:
+    suite_path = suite_path.resolve()
+    suite = _load_suite(suite_path)
+    resolved_run_id = run_id or _default_run_id()
+    resolved_results_root = Path(results_root or DEFAULT_RESULTS_ROOT).resolve()
+    run_dir = resolved_results_root / resolved_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(suite_path, run_dir / "suite.yaml")
+
+    scenario_path = _resolve_scenario_path(suite_path, suite["scenario"])
+    trials = int(suite.get("trials", 1))
+    matrix = suite.get("matrix") or []
+    if trials < 1:
+        raise ValueError("Suite 'trials' must be at least 1")
+    if not isinstance(matrix, list) or not matrix:
+        raise ValueError("Suite 'matrix' must be a non-empty list")
+
+    specs = []
+    trial_index = 0
+    for entry in matrix:
+        if not isinstance(entry, dict):
+            raise ValueError("Every suite matrix entry must be a mapping")
+        harness_id = str(entry["harness"])
+        params_path = _resolve_params_path(suite_path, harness_id, entry.get("params"))
+        params_override = entry.get("params_override")
+        if params_override is not None and not isinstance(params_override, dict):
+            raise ValueError("'params_override' must be a mapping")
+
+        for _ in range(trials):
+            spec = resolve_trial_spec(
+                scenario_path=scenario_path,
+                harness_id=harness_id,
+                params_path=params_path,
+                params_override=params_override,
+                run_id=resolved_run_id,
+                trial_index=trial_index,
+                rom_path=rom_path,
+                results_root=resolved_results_root,
+            )
+            specs.append(trial_spec_to_payload(spec))
+            trial_index += 1
+
+    return SuiteInit(
+        run_id=resolved_run_id,
+        run_dir=str(run_dir),
+        trial_specs=specs,
+        task_queue=task_queue,
+        continue_as_new_every=continue_as_new_every,
+    )
+
+
 def inspect_trial(trial_dir: Path) -> dict[str, Any]:
     trial_dir = trial_dir.resolve()
     trial = _read_json(trial_dir / "trial.json")
@@ -183,6 +291,14 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id")
     run.add_argument("--rom")
     run.add_argument("--results-root")
+    run.add_argument(
+        "--temporal",
+        action="store_true",
+        help="Run the suite through Temporal instead of the local loop",
+    )
+    run.add_argument("--temporal-address", default=DEFAULT_TEMPORAL_ADDRESS)
+    run.add_argument("--temporal-namespace", default=DEFAULT_TEMPORAL_NAMESPACE)
+    run.add_argument("--task-queue", default=DEFAULT_TASK_QUEUE)
     run.set_defaults(func=run_suite_command)
 
     inspect = subcommands.add_parser("inspect", help="Inspect a completed trial")
@@ -324,6 +440,33 @@ def _read_summary_rows(run_dir: Path) -> list[dict[str, Any]]:
 
 def _default_run_id() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+async def _run_suite_temporal_async(
+    suite_init: SuiteInit,
+    *,
+    address: str,
+    namespace: str,
+    task_queue: str,
+) -> Path:
+    try:
+        from temporalio.client import Client
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Temporal support requires the 'temporalio' package. "
+            "Install project requirements before using --temporal."
+        ) from exc
+
+    from evals.workflows import SweepWorkflow
+
+    client = await Client.connect(address, namespace=namespace)
+    result = await client.execute_workflow(
+        SweepWorkflow.run,
+        suite_init,
+        id=f"eval-suite-{suite_init.run_id}",
+        task_queue=task_queue,
+    )
+    return Path(result["run_dir"])
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,0 +1,9 @@
+id: temporal_init_success
+description: Temporal smoke scenario that succeeds from the initial bedroom save state.
+initial_state: states/after_names_bedroom.state
+success:
+  location_eq: PLAYERS_HOUSE_2F
+limits:
+  max_steps: 1
+  max_seconds: 60
+  max_usd: 0.01
