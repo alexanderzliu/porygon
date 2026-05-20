@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from typing import Any
 
@@ -144,18 +145,13 @@ class SweepWorkflow:
     @workflow.run
     async def run(self, input: SuiteInit | dict[str, Any]) -> dict[str, Any]:
         input = _suite_init(input)
-        trials = []
-        for spec in input.trial_specs:
-            trial = await workflow.execute_child_workflow(
-                TrialWorkflow.run,
-                TrialInit(
-                    spec=spec,
-                    continue_as_new_every=input.continue_as_new_every,
-                ),
-                id=f"eval-trial-{spec['run_id']}-{spec['trial_id']}",
-                task_queue=input.task_queue or DEFAULT_TASK_QUEUE,
-            )
-            trials.append(trial)
+        semaphore = asyncio.Semaphore(max(1, int(input.concurrency)))
+        trials = await asyncio.gather(
+            *[
+                _run_trial_child(input, spec, semaphore)
+                for spec in input.trial_specs
+            ]
+        )
 
         summary = await workflow.execute_activity(
             "finalize_sweep",
@@ -198,6 +194,23 @@ def _should_continue_as_new(totals: dict[str, Any], every: int) -> bool:
         return bool(workflow.info().is_continue_as_new_suggested())
     except Exception:  # noqa: BLE001 - fallback outside a real workflow.
         return False
+
+
+async def _run_trial_child(
+    input: SuiteInit,
+    spec: dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> dict[str, Any]:
+    async with semaphore:
+        return await workflow.execute_child_workflow(
+            TrialWorkflow.run,
+            TrialInit(
+                spec=spec,
+                continue_as_new_every=input.continue_as_new_every,
+            ),
+            id=f"eval-trial-{spec['run_id']}-{spec['trial_id']}",
+            task_queue=input.task_queue or DEFAULT_TASK_QUEUE,
+        )
 
 
 def _trial_init(value: TrialInit | dict[str, Any]) -> TrialInit:

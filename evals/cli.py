@@ -59,8 +59,11 @@ def run_suite_command(args: argparse.Namespace) -> None:
             address=args.temporal_address,
             namespace=args.temporal_namespace,
             task_queue=args.task_queue,
+            concurrency=args.concurrency,
         )
     else:
+        if args.concurrency is not None:
+            raise ValueError("--concurrency only applies when --temporal is set")
         run_dir = run_suite(
             Path(args.suite),
             run_id=args.run_id,
@@ -148,6 +151,7 @@ def run_suite_temporal(
     address: str = DEFAULT_TEMPORAL_ADDRESS,
     namespace: str = DEFAULT_TEMPORAL_NAMESPACE,
     task_queue: str = DEFAULT_TASK_QUEUE,
+    concurrency: int | None = None,
     continue_as_new_every: int = 250,
 ) -> Path:
     suite_init = resolve_suite_temporal_init(
@@ -156,6 +160,7 @@ def run_suite_temporal(
         rom_path=rom_path,
         results_root=results_root,
         task_queue=task_queue,
+        concurrency=concurrency,
         continue_as_new_every=continue_as_new_every,
     )
     return asyncio.run(
@@ -175,6 +180,7 @@ def resolve_suite_temporal_init(
     rom_path: str | Path | None = None,
     results_root: str | Path | None = None,
     task_queue: str = DEFAULT_TASK_QUEUE,
+    concurrency: int | None = None,
     continue_as_new_every: int = 250,
 ) -> SuiteInit:
     suite_path = suite_path.resolve()
@@ -192,6 +198,11 @@ def resolve_suite_temporal_init(
         raise ValueError("Suite 'trials' must be at least 1")
     if not isinstance(matrix, list) or not matrix:
         raise ValueError("Suite 'matrix' must be a non-empty list")
+    resolved_concurrency = (
+        _positive_int(concurrency, "--concurrency")
+        if concurrency is not None
+        else _positive_int(suite.get("concurrency", 1), "Suite 'concurrency'")
+    )
 
     specs = []
     trial_index = 0
@@ -223,6 +234,7 @@ def resolve_suite_temporal_init(
         run_dir=str(run_dir),
         trial_specs=specs,
         task_queue=task_queue,
+        concurrency=resolved_concurrency,
         continue_as_new_every=continue_as_new_every,
     )
 
@@ -299,6 +311,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--temporal-address", default=DEFAULT_TEMPORAL_ADDRESS)
     run.add_argument("--temporal-namespace", default=DEFAULT_TEMPORAL_NAMESPACE)
     run.add_argument("--task-queue", default=DEFAULT_TASK_QUEUE)
+    run.add_argument(
+        "--concurrency",
+        type=_positive_int_arg,
+        help="Override suite concurrency for Temporal child workflow fan-out",
+    )
     run.set_defaults(func=run_suite_command)
 
     inspect = subcommands.add_parser("inspect", help="Inspect a completed trial")
@@ -323,10 +340,22 @@ def _load_suite(suite_path: Path) -> dict[str, Any]:
     if "scenario" not in suite:
         raise ValueError("Suite must include 'scenario'")
 
-    concurrency = int(suite.get("concurrency", 1))
-    if concurrency < 1:
-        raise ValueError("Suite 'concurrency' must be at least 1")
+    _positive_int(suite.get("concurrency", 1), "Suite 'concurrency'")
     return suite
+
+
+def _positive_int(value: Any, label: str) -> int:
+    resolved = int(value)
+    if resolved < 1:
+        raise ValueError(f"{label} must be at least 1")
+    return resolved
+
+
+def _positive_int_arg(value: str) -> int:
+    try:
+        return _positive_int(value, "--concurrency")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _load_params_override(raw: str | None) -> dict[str, Any] | None:

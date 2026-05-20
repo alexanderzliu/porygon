@@ -29,6 +29,7 @@ class SuiteInit:
     run_dir: str
     trial_specs: list[dict[str, Any]]
     task_queue: str = DEFAULT_TASK_QUEUE
+    concurrency: int = 1
     continue_as_new_every: int = 250
 
 
