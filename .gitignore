@@ -48,3 +48,6 @@ ENV/
 
 # System
 .DS_Store
+
+# Internal scaffolding (kept locally, not tracked)
+docs/superpowers/
